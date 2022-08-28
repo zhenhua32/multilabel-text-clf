@@ -1,29 +1,34 @@
-# Importing stock ml libraries
+# region 导入模块
+
+import json
+import logging
 import warnings
 
-warnings.simplefilter("ignore")
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from tqdm import tqdm
-from sklearn import metrics
-import transformers
 import torch
-from torch.utils.data import Dataset, DataLoader, RandomSampler, SequentialSampler
-from transformers import DistilBertTokenizer, DistilBertModel
-import logging
+import transformers
+from sklearn import metrics
+from sklearn.preprocessing import MultiLabelBinarizer
+from torch import cuda
+from torch.utils.data import DataLoader, Dataset, RandomSampler, SequentialSampler
+from tqdm import tqdm
+from transformers import BertConfig, BertModel, BertTokenizer, DistilBertModel, DistilBertTokenizer
+
+import wandb
 
 logging.basicConfig(level=logging.ERROR)
-import numpy as np
-import json
-import wandb
+warnings.simplefilter("ignore")
+
+# endregion
 
 # 初始化 wandb
 wandb.init(project="multilabel")
 
-# Source Data
+# region 导入数据集
 dataset = "bert_R21578"  # [ 'R21578', 'RCV1-V2', 'Econbiz', 'Amazon-531', 'DBPedia-298','NYT AC','GoEmotions']
 labels = 90  # [90,101,5658,512,298,166,28]
-epochs = 15  # [15,15,15,15,5,15,5]
 train_list = json.load(
     open("../multi_label_data/reuters/train_data.json")
 )  # change the dataset folder name [ 'reuters', 'rcv1-v2', 'econbiz', 'amazon', 'dbpedia','nyt','goemotions']
@@ -33,16 +38,13 @@ test_list = json.load(open("../multi_label_data/reuters/test_data.json"))  # cha
 test_data = np.array(list(map(lambda x: list(x.values())[:2], test_list)), dtype=object)
 test_labels = np.array(list(map(lambda x: list(x.values())[2], test_list)), dtype=object)
 
-
-# Preprocess Labels
-from sklearn.preprocessing import MultiLabelBinarizer
-
+# 处理多标签
 label_encoder = MultiLabelBinarizer()
 label_encoder.fit(train_labels)
 train_labels_enc = label_encoder.transform(train_labels)
 test_labels_enc = label_encoder.transform(test_labels)
 
-# Create DataFrames
+# 先用 pandas 存储起来, 后续作为 torch 的 dataset
 train_df = pd.DataFrame()
 train_df["text"] = train_data[:, 1]
 train_df["labels"] = train_labels_enc.tolist()
@@ -58,31 +60,21 @@ print("Number of test labels ", len(test_df["labels"]))
 train_df.head()
 test_df
 
+# endregion
 
 #  Setting up the device for GPU usage
-from torch import cuda
-
 device = "cuda" if cuda.is_available() else "cpu"
 
-# Importing stock ml libraries
-import numpy as np
-import pandas as pd
-from sklearn import metrics
-import transformers
-import torch
-from torch.utils.data import Dataset, DataLoader, RandomSampler, SequentialSampler
-from transformers import BertTokenizer, BertModel, BertConfig
-
-
-# Sections of config
+# 定义超参数
 # Defining some key variables that will be used later on in the training
 MAX_LEN = 64
 TRAIN_BATCH_SIZE = 4
 VALID_BATCH_SIZE = 4
 EPOCHS = 1  # epochs
 LEARNING_RATE = 1e-05
-tokenizer = BertTokenizer.from_pretrained("bert-base-uncased", do_lower_case=True, padding=True)
+HF_MODEL = "bert-base-uncased"
 
+tokenizer = BertTokenizer.from_pretrained(HF_MODEL, do_lower_case=True, padding=True)
 wandb.config.update(
     {
         "max_len": MAX_LEN,
@@ -94,9 +86,9 @@ wandb.config.update(
 )
 
 
-# Define CustomDataset
+# region 将数据集转换成 torch 的 Dataset 类, 并使用 DataLoader
 class CustomDataset(Dataset):
-    def __init__(self, dataframe, tokenizer, max_len):
+    def __init__(self, dataframe: pd.DataFrame, tokenizer: BertTokenizer, max_len: int):
         self.tokenizer = tokenizer
         self.data = dataframe
         self.text = dataframe.text
@@ -155,12 +147,16 @@ training_loader = DataLoader(training_set, **train_params)
 validation_loader = DataLoader(validation_set, **test_params)
 testing_loader = DataLoader(testing_set, **test_params)
 
+# endregion
 
+
+# region 定义模型
+# 模型本身还是非常简单的结构
 # Creating the customized model, by adding a drop out and a dense layer on top of distil bert to get the final output for the model.
 class BERTClass(torch.nn.Module):
     def __init__(self):
         super(BERTClass, self).__init__()
-        self.l1 = transformers.BertModel.from_pretrained("bert-base-uncased")
+        self.l1 = transformers.BertModel.from_pretrained(HF_MODEL)
         self.l2 = torch.nn.Dropout(0.3)
         self.l3 = torch.nn.Linear(768, labels)
 
@@ -175,8 +171,9 @@ class BERTClass(torch.nn.Module):
 
 model = BERTClass()
 model.to(device)
-
 wandb.watch(model)
+# endregion
+
 
 # Define Loss function
 def loss_fn(outputs, targets):
@@ -185,10 +182,8 @@ def loss_fn(outputs, targets):
 
 optimizer = torch.optim.Adam(params=model.parameters(), lr=LEARNING_RATE)
 
+
 # Plot Val loss
-import matplotlib.pyplot as plt
-
-
 def loss_plot(epochs, loss):
     plt.plot(epochs, loss, color="red", label="loss")
     plt.xlabel("epochs")
@@ -197,8 +192,15 @@ def loss_plot(epochs, loss):
 
 
 # Train Model
-def train_model(start_epochs, n_epochs, training_loader, validation_loader, model, optimizer):
-    loss_vals = []
+def train_model(
+    start_epochs: int,
+    n_epochs: int,
+    training_loader: DataLoader,
+    validation_loader: DataLoader,
+    model: BERTClass,
+    optimizer: torch.optim.Optimizer,
+):
+    loss_vals = []  # 验证集的损失
     for epoch in range(start_epochs, n_epochs + 1):
         train_loss = 0
         valid_loss = 0
@@ -272,10 +274,14 @@ def train_model(start_epochs, n_epochs, training_loader, validation_loader, mode
     return model
 
 
+# 训练模型s
 trained_model = train_model(1, EPOCHS, training_loader, validation_loader, model, optimizer)
 
 
-def validation(testing_loader):
+def validation(testing_loader: DataLoader):
+    """
+    执行推理, 获取模型的输出和实际标签
+    """
     model.eval()
     fin_targets = []
     fin_outputs = []
