@@ -24,25 +24,29 @@ warnings.simplefilter("ignore")
 # endregion
 
 # 初始化 wandb
+# wandb.init(project="multilabel", mode="disabled")
 wandb.init(project="multilabel")
 
 # region 导入数据集
-dataset = "bert_R21578"  # [ 'R21578', 'RCV1-V2', 'Econbiz', 'Amazon-531', 'DBPedia-298','NYT AC','GoEmotions']
-labels = 90  # [90,101,5658,512,298,166,28]
+dataset = "Econbiz"  # [ 'R21578', 'RCV1-V2', 'Econbiz', 'Amazon-531', 'DBPedia-298','NYT AC','GoEmotions']
+labels = 5658  # [90,101,5658,512,298,166,28]
 train_list = json.load(
-    open("../multi_label_data/reuters/train_data.json")
+    open("../multi_label_data/econbiz/train_data.json")
 )  # change the dataset folder name [ 'reuters', 'rcv1-v2', 'econbiz', 'amazon', 'dbpedia','nyt','goemotions']
+# TODO: 待优化, 这段代码, 或者下面的 df 代码有坑, 这里可是有百万级别的数据, 直接载入内存就炸了
 train_data = np.array(list(map(lambda x: (list(x.values())[:2]), train_list)), dtype=object)
 train_labels = np.array(list(map(lambda x: list(x.values())[2], train_list)), dtype=object)
-test_list = json.load(open("../multi_label_data/reuters/test_data.json"))  # change dataset folder name
+test_list = json.load(open("../multi_label_data/econbiz/test_data.json"))  # change dataset folder name
 test_data = np.array(list(map(lambda x: list(x.values())[:2], test_list)), dtype=object)
 test_labels = np.array(list(map(lambda x: list(x.values())[2], test_list)), dtype=object)
+print("已经将数据加载到 numpy 中")
 
 # 处理多标签
 label_encoder = MultiLabelBinarizer()
 label_encoder.fit(train_labels)
 train_labels_enc = label_encoder.transform(train_labels)
 test_labels_enc = label_encoder.transform(test_labels)
+print("已经使用 sklearn 生成多标签")
 
 # 先用 pandas 存储起来, 后续作为 torch 的 dataset
 train_df = pd.DataFrame()
@@ -52,6 +56,10 @@ train_df["labels"] = train_labels_enc.tolist()
 test_df = pd.DataFrame()
 test_df["text"] = test_data[:, 1]
 test_df["labels"] = test_labels_enc.tolist()
+
+# 先拿小批量的数据试一下
+# train_df = train_df.sample(n=20000)
+# test_df = test_df.sample(n=5000)
 
 print("Number of train texts ", len(train_df["text"]))
 print("Number of train labels ", len(train_df["labels"]))
@@ -68,9 +76,9 @@ device = "cuda" if cuda.is_available() else "cpu"
 # 定义超参数
 # Defining some key variables that will be used later on in the training
 MAX_LEN = 64
-TRAIN_BATCH_SIZE = 4
-VALID_BATCH_SIZE = 4
-EPOCHS = 1  # epochs
+TRAIN_BATCH_SIZE = 256
+VALID_BATCH_SIZE = 256
+EPOCHS = 15  # epochs
 LEARNING_RATE = 1e-05
 HF_MODEL = "bert-base-uncased"
 
@@ -191,6 +199,58 @@ def loss_plot(epochs, loss):
     plt.savefig(dataset + "_val_loss.png")
 
 
+def validation(model: BERTClass, testing_loader: DataLoader):
+    """
+    执行推理, 获取模型的输出和实际标签
+    """
+    model.eval()
+    fin_targets = []
+    fin_outputs = []
+    with torch.no_grad():
+        for _, data in enumerate(testing_loader, 0):
+            ids = data["ids"].to(device, dtype=torch.long)
+            mask = data["mask"].to(device, dtype=torch.long)
+            token_type_ids = data["token_type_ids"].to(device, dtype=torch.long)
+            targets = data["targets"].to(device, dtype=torch.float)
+            outputs = model(ids, mask, token_type_ids)
+            fin_targets.extend(targets.cpu().detach().numpy().tolist())
+            fin_outputs.extend(torch.sigmoid(outputs).cpu().detach().numpy().tolist())
+    return fin_outputs, fin_targets
+
+
+# Test Model
+def validation_on_test_data(model: BERTClass, testing_loader: DataLoader):
+    outputs, targets = validation(model, testing_loader)
+    outputs = np.array(outputs) >= 0.5
+    accuracy = metrics.accuracy_score(targets, outputs)
+    f1_score_avg = metrics.f1_score(targets, outputs, average="samples")
+    f1_score_micro = metrics.f1_score(targets, outputs, average="micro")
+    f1_score_macro = metrics.f1_score(targets, outputs, average="macro")
+    print(f"Accuracy Score = {accuracy}")
+    print(f"F1 Score (Samples) = {f1_score_avg}")
+    print(f"F1 Score (Micro) = {f1_score_micro}")
+    print(f"F1 Score (Macro) = {f1_score_macro}")
+
+    wandb.log(
+        {
+            "accuracy": accuracy,
+            "f1_score_avg": f1_score_avg,
+            "f1_score_micro": f1_score_micro,
+            "f1_score_macro": f1_score_macro,
+        }
+    )
+
+    # Save results
+    with open(dataset + "_results.txt", "w") as f:
+        print(
+            f"F1 Score (Samples) = {f1_score_avg}",
+            f"Accuracy Score = {accuracy}",
+            f"F1 Score (Micro) = {f1_score_micro}",
+            f"F1 Score (Macro) = {f1_score_macro}",
+            file=f,
+        )
+
+
 # Train Model
 def train_model(
     start_epochs: int,
@@ -213,7 +273,7 @@ def train_model(
 
         model.train()
         print("############# Epoch {}: Training Start   #############".format(epoch))
-        for batch_idx, data in enumerate(training_loader):
+        for batch_idx, data in tqdm(enumerate(training_loader), total=len(training_loader)):
             optimizer.zero_grad()
 
             # Forward
@@ -269,61 +329,14 @@ def train_model(
 
             wandb.log({"train_loss": train_loss, "valid_loss": valid_loss, "epoch": epoch})
 
-        # Plot loss
+        # 每次执行完后评估一下
+        validation_on_test_data(model, validation_loader)
+
+    # Plot loss
     loss_plot(np.linspace(1, n_epochs, n_epochs).astype(int), loss_vals)
     return model
 
 
-# 训练模型s
+# 训练模型
 trained_model = train_model(1, EPOCHS, training_loader, validation_loader, model, optimizer)
-
-
-def validation(testing_loader: DataLoader):
-    """
-    执行推理, 获取模型的输出和实际标签
-    """
-    model.eval()
-    fin_targets = []
-    fin_outputs = []
-    with torch.no_grad():
-        for _, data in enumerate(testing_loader, 0):
-            ids = data["ids"].to(device, dtype=torch.long)
-            mask = data["mask"].to(device, dtype=torch.long)
-            token_type_ids = data["token_type_ids"].to(device, dtype=torch.long)
-            targets = data["targets"].to(device, dtype=torch.float)
-            outputs = model(ids, mask, token_type_ids)
-            fin_targets.extend(targets.cpu().detach().numpy().tolist())
-            fin_outputs.extend(torch.sigmoid(outputs).cpu().detach().numpy().tolist())
-    return fin_outputs, fin_targets
-
-
-# Test Model
-outputs, targets = validation(testing_loader)
-outputs = np.array(outputs) >= 0.5
-accuracy = metrics.accuracy_score(targets, outputs)
-f1_score_avg = metrics.f1_score(targets, outputs, average="samples")
-f1_score_micro = metrics.f1_score(targets, outputs, average="micro")
-f1_score_macro = metrics.f1_score(targets, outputs, average="macro")
-print(f"Accuracy Score = {accuracy}")
-print(f"F1 Score (Samples) = {f1_score_avg}")
-print(f"F1 Score (Micro) = {f1_score_micro}")
-print(f"F1 Score (Macro) = {f1_score_macro}")
-
-wandb.log(
-    {
-        "accuracy": accuracy,
-        "f1_score_avg": f1_score_avg,
-        "f1_score_micro": f1_score_micro,
-        "f1_score_macro": f1_score_macro,
-    }
-)
-
-# Save results
-with open(dataset + "_results.txt", "w") as f:
-    print(
-        f"F1 Score (Samples) = {f1_score_avg}",
-        f"Accuracy Score = {accuracy}",
-        f"F1 Score (Micro) = {f1_score_micro}",
-        f"F1 Score (Macro) = {f1_score_macro}",
-        file=f,
-    )
+validation_on_test_data(train_model, testing_loader)
