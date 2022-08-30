@@ -24,8 +24,8 @@ warnings.simplefilter("ignore")
 # endregion
 
 # 初始化 wandb
-# wandb.init(project="multilabel", mode="disabled")
-wandb.init(project="multilabel")
+wandb.init(project="multilabel", mode="disabled")
+# wandb.init(project="multilabel")
 
 # region 导入数据集
 dataset = "Econbiz"  # [ 'R21578', 'RCV1-V2', 'Econbiz', 'Amazon-531', 'DBPedia-298','NYT AC','GoEmotions']
@@ -33,7 +33,6 @@ labels = 5658  # [90,101,5658,512,298,166,28]
 train_list = json.load(
     open("../multi_label_data/econbiz/train_data.json")
 )  # change the dataset folder name [ 'reuters', 'rcv1-v2', 'econbiz', 'amazon', 'dbpedia','nyt','goemotions']
-# TODO: 待优化, 这段代码, 或者下面的 df 代码有坑, 这里可是有百万级别的数据, 直接载入内存就炸了
 train_data = np.array(list(map(lambda x: (list(x.values())[:2]), train_list)), dtype=object)
 train_labels = np.array(list(map(lambda x: list(x.values())[2], train_list)), dtype=object)
 test_list = json.load(open("../multi_label_data/econbiz/test_data.json"))  # change dataset folder name
@@ -46,16 +45,20 @@ label_encoder = MultiLabelBinarizer()
 label_encoder.fit(train_labels)
 train_labels_enc = label_encoder.transform(train_labels)
 test_labels_enc = label_encoder.transform(test_labels)
+# 减少内存使用
+train_labels_enc = train_labels_enc.astype(np.int8, copy=False)
+test_labels_enc = test_labels_enc.astype(np.int8, copy=False)
 print("已经使用 sklearn 生成多标签")
 
 # 先用 pandas 存储起来, 后续作为 torch 的 dataset
 train_df = pd.DataFrame()
 train_df["text"] = train_data[:, 1]
-train_df["labels"] = train_labels_enc.tolist()
+# 减少内存使用, 直接用 train_labels_enc.tolist() 内存会爆炸
+train_df["labels"] = list(map(lambda x: np.squeeze(x), np.split(train_labels_enc, train_labels_enc.shape[0])))
 
 test_df = pd.DataFrame()
 test_df["text"] = test_data[:, 1]
-test_df["labels"] = test_labels_enc.tolist()
+test_df["labels"] = list(map(lambda x: np.squeeze(x), np.split(test_labels_enc, test_labels_enc.shape[0])))
 
 # 先拿小批量的数据试一下
 # train_df = train_df.sample(n=20000)
@@ -65,8 +68,9 @@ print("Number of train texts ", len(train_df["text"]))
 print("Number of train labels ", len(train_df["labels"]))
 print("Number of test texts ", len(test_df["text"]))
 print("Number of test labels ", len(test_df["labels"]))
-train_df.head()
-test_df
+print(train_df.head())
+print(train_df.shape)
+print(test_df.shape)
 
 # endregion
 
@@ -204,24 +208,31 @@ def validation(model: BERTClass, testing_loader: DataLoader):
     执行推理, 获取模型的输出和实际标签
     """
     model.eval()
+    # 注意需要将 shape 修改为 (0, 标签数), 方便后面使用 concatenate
     fin_targets = []
     fin_outputs = []
     with torch.no_grad():
-        for _, data in enumerate(testing_loader, 0):
+        for _, data in tqdm(enumerate(testing_loader, 0), total=len(testing_loader)):
             ids = data["ids"].to(device, dtype=torch.long)
             mask = data["mask"].to(device, dtype=torch.long)
             token_type_ids = data["token_type_ids"].to(device, dtype=torch.long)
             targets = data["targets"].to(device, dtype=torch.float)
             outputs = model(ids, mask, token_type_ids)
-            fin_targets.extend(targets.cpu().detach().numpy().tolist())
-            fin_outputs.extend(torch.sigmoid(outputs).cpu().detach().numpy().tolist())
+            # 这个操作太慢了, 拖慢了速度
+            fin_targets.append(targets.cpu().detach().numpy())
+            fin_outputs.append(torch.sigmoid(outputs).cpu().detach().numpy())
+    fin_targets = np.concatenate(fin_targets)
+    fin_outputs = np.concatenate(fin_outputs)
     return fin_outputs, fin_targets
 
 
 # Test Model
 def validation_on_test_data(model: BERTClass, testing_loader: DataLoader):
+    # TODO: 生成的矩阵可能太大了, 无法一次性加载进内存
     outputs, targets = validation(model, testing_loader)
+    print("已经完成推理")
     outputs = np.array(outputs) >= 0.5
+    # TODO sklearn 也会造成内存爆炸, 而且很慢
     accuracy = metrics.accuracy_score(targets, outputs)
     f1_score_avg = metrics.f1_score(targets, outputs, average="samples")
     f1_score_micro = metrics.f1_score(targets, outputs, average="micro")
@@ -270,6 +281,7 @@ def train_model(
         ######################
         # Train the model #
         ######################
+        validation_on_test_data(model, validation_loader)
 
         model.train()
         print("############# Epoch {}: Training Start   #############".format(epoch))
