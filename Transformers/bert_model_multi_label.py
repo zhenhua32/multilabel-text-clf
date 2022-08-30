@@ -3,6 +3,7 @@
 import json
 import logging
 import warnings
+import time
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -24,8 +25,8 @@ warnings.simplefilter("ignore")
 # endregion
 
 # 初始化 wandb
-wandb.init(project="multilabel", mode="disabled")
-# wandb.init(project="multilabel")
+# wandb.init(project="multilabel", mode="disabled")
+wandb.init(project="multilabel")
 
 # region 导入数据集
 dataset = "Econbiz"  # [ 'R21578', 'RCV1-V2', 'Econbiz', 'Amazon-531', 'DBPedia-298','NYT AC','GoEmotions']
@@ -233,10 +234,18 @@ def validation_on_test_data(model: BERTClass, testing_loader: DataLoader):
     print("已经完成推理")
     outputs = np.array(outputs) >= 0.5
     # TODO sklearn 也会造成内存爆炸, 而且很慢
+    start = time.time()
     accuracy = metrics.accuracy_score(targets, outputs)
+    print(time.time() - start)
+    start = time.time()
     f1_score_avg = metrics.f1_score(targets, outputs, average="samples")
+    print(time.time() - start)
+    start = time.time()
     f1_score_micro = metrics.f1_score(targets, outputs, average="micro")
+    print(time.time() - start)
+    start = time.time()
     f1_score_macro = metrics.f1_score(targets, outputs, average="macro")
+    print(time.time() - start)
     print(f"Accuracy Score = {accuracy}")
     print(f"F1 Score (Samples) = {f1_score_avg}")
     print(f"F1 Score (Micro) = {f1_score_micro}")
@@ -281,7 +290,6 @@ def train_model(
         ######################
         # Train the model #
         ######################
-        validation_on_test_data(model, validation_loader)
 
         model.train()
         print("############# Epoch {}: Training Start   #############".format(epoch))
