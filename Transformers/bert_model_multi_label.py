@@ -359,4 +359,4 @@ def train_model(
 
 # 训练模型
 trained_model = train_model(1, EPOCHS, training_loader, validation_loader, model, optimizer)
-validation_on_test_data(train_model, testing_loader)
+validation_on_test_data(trained_model, testing_loader)
