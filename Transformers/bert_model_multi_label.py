@@ -1,3 +1,7 @@
+"""
+主要验证下怎么减少内存的使用, Econbiz 这个数据集有100w的数据, 直接全部加载的话, 内存会炸
+"""
+
 # region 导入模块
 
 import json
@@ -24,6 +28,7 @@ warnings.simplefilter("ignore")
 
 # endregion
 
+
 # 初始化 wandb
 # wandb.init(project="multilabel", mode="disabled")
 wandb.init(project="multilabel")
@@ -31,48 +36,18 @@ wandb.init(project="multilabel")
 # region 导入数据集
 dataset = "Econbiz"  # [ 'R21578', 'RCV1-V2', 'Econbiz', 'Amazon-531', 'DBPedia-298','NYT AC','GoEmotions']
 labels = 5658  # [90,101,5658,512,298,166,28]
-train_list = json.load(
-    open("../multi_label_data/econbiz/train_data.json")
-)  # change the dataset folder name [ 'reuters', 'rcv1-v2', 'econbiz', 'amazon', 'dbpedia','nyt','goemotions']
-train_data = np.array(list(map(lambda x: (list(x.values())[:2]), train_list)), dtype=object)
-train_labels = np.array(list(map(lambda x: list(x.values())[2], train_list)), dtype=object)
-test_list = json.load(open("../multi_label_data/econbiz/test_data.json"))  # change dataset folder name
-test_data = np.array(list(map(lambda x: list(x.values())[:2], test_list)), dtype=object)
-test_labels = np.array(list(map(lambda x: list(x.values())[2], test_list)), dtype=object)
-print("已经将数据加载到 numpy 中")
+# change the dataset folder name [ 'reuters', 'rcv1-v2', 'econbiz', 'amazon', 'dbpedia','nyt','goemotions']
+train_file = "../multi_label_data/econbiz/train_data.json"
+test_file = "../multi_label_data/econbiz/test_data.json"
 
-# 处理多标签
+# 初始化 MultiLabelBinarizer, 用训练数据 fit 下.
+# 本身数据量变成 pandas 是不太的, 大的是 MultiLabelBinarizer 处理后的, 因为类多, 所以生成的矩阵非常大
+train_list = json.load(open(train_file, "r", encoding="utf-8"))
+train_df = pd.DataFrame(train_list)
+test_list = json.load(open(test_file, "r", encoding="utf-8"))
+test_df = pd.DataFrame(test_list)
 label_encoder = MultiLabelBinarizer()
-label_encoder.fit(train_labels)
-train_labels_enc = label_encoder.transform(train_labels)
-test_labels_enc = label_encoder.transform(test_labels)
-# 减少内存使用
-train_labels_enc = train_labels_enc.astype(np.int8, copy=False)
-test_labels_enc = test_labels_enc.astype(np.int8, copy=False)
-print("已经使用 sklearn 生成多标签")
-
-# 先用 pandas 存储起来, 后续作为 torch 的 dataset
-train_df = pd.DataFrame()
-train_df["text"] = train_data[:, 1]
-# 减少内存使用, 直接用 train_labels_enc.tolist() 内存会爆炸
-train_df["labels"] = list(map(lambda x: np.squeeze(x), np.split(train_labels_enc, train_labels_enc.shape[0])))
-
-test_df = pd.DataFrame()
-test_df["text"] = test_data[:, 1]
-test_df["labels"] = list(map(lambda x: np.squeeze(x), np.split(test_labels_enc, test_labels_enc.shape[0])))
-
-# 先拿小批量的数据试一下
-# train_df = train_df.sample(n=20000)
-# test_df = test_df.sample(n=5000)
-
-print("Number of train texts ", len(train_df["text"]))
-print("Number of train labels ", len(train_df["labels"]))
-print("Number of test texts ", len(test_df["text"]))
-print("Number of test labels ", len(test_df["labels"]))
-print(train_df.head())
-print(train_df.shape)
-print(test_df.shape)
-
+label_encoder.fit(train_df["labels"])
 # endregion
 
 #  Setting up the device for GPU usage
@@ -101,12 +76,12 @@ wandb.config.update(
 
 # region 将数据集转换成 torch 的 Dataset 类, 并使用 DataLoader
 class CustomDataset(Dataset):
-    def __init__(self, dataframe: pd.DataFrame, tokenizer: BertTokenizer, max_len: int):
+    def __init__(self, df: pd.DataFrame, tokenizer: BertTokenizer, max_len: int):
         self.tokenizer = tokenizer
-        self.data = dataframe
-        self.text = dataframe.text
-        self.targets = self.data.labels
         self.max_len = max_len
+        self.df = df
+        self.text = self.df["text"]
+        self.labels = self.df["labels"]
 
     def __len__(self):
         return len(self.text)
@@ -128,11 +103,13 @@ class CustomDataset(Dataset):
         mask = inputs["attention_mask"]
         token_type_ids = inputs["token_type_ids"]
 
+        # 每次处理一条数据
+        targets = label_encoder.transform([self.labels[index]])[0]
         return {
             "ids": torch.tensor(ids, dtype=torch.long),
             "mask": torch.tensor(mask, dtype=torch.long),
             "token_type_ids": torch.tensor(token_type_ids, dtype=torch.long),
-            "targets": torch.tensor(self.targets[index], dtype=torch.float),
+            "targets": torch.tensor(targets, dtype=torch.float),
         }
 
 
@@ -154,8 +131,7 @@ testing_set = CustomDataset(test_dataset, tokenizer, MAX_LEN)
 
 # Load Data
 train_params = {"batch_size": TRAIN_BATCH_SIZE, "shuffle": True, "num_workers": 0}
-
-test_params = {"batch_size": VALID_BATCH_SIZE, "shuffle": True, "num_workers": 0}
+test_params = {"batch_size": VALID_BATCH_SIZE, "shuffle": False, "num_workers": 0}
 training_loader = DataLoader(training_set, **train_params)
 validation_loader = DataLoader(validation_set, **test_params)
 testing_loader = DataLoader(testing_set, **test_params)
