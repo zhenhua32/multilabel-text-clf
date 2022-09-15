@@ -21,3 +21,7 @@ The code for single-label results (with the exception of gMLP/aMLP) can be found
 
 ### Contributors:
 Andor Diera, Bao Xin Lin, Bhakti Khera, Tim Meuser, Tushar Singhal, Lukas Galke and Ansgar Scherp
+
+# 论文地址
+
+https://arxiv.org/abs/2204.03954
