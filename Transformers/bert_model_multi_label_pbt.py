@@ -23,6 +23,7 @@ from ray.air.checkpoint import Checkpoint
 from ray.tune.integration.wandb import WandbLoggerCallback
 from ray.tune.logger import DEFAULT_LOGGERS
 from ray.tune.schedulers import PopulationBasedTraining
+from ray.tune.tuner import Tuner
 from sklearn import metrics
 from sklearn.preprocessing import MultiLabelBinarizer
 from torch import cuda
@@ -64,7 +65,7 @@ TRAIN_BATCH_SIZE = 16
 VALID_BATCH_SIZE = 16
 EPOCHS = 15  # epochs
 LEARNING_RATE = 1e-05
-HF_MODEL = "bert-base-uncased"
+HF_MODEL = r"D:\code\pretrain_model_dir\bert-base-uncased"
 
 tokenizer = BertTokenizer.from_pretrained(HF_MODEL, do_lower_case=True, padding=True)
 
@@ -347,38 +348,49 @@ def run_tune_pbt():
     pbt = PopulationBasedTraining(
         time_attr="training_iteration",
         perturbation_interval=4,
+        # 定义需要突变的超参数
         hyperparam_mutations={
-            "lr": lambda: random.uniform(1e-6, 1e-4),
+            "lr": lambda: random.uniform(1e-6, 1e-3),
         },
     )
-
-    tuner = tune.Tuner(
-        # 资源控制是非常重要的, 默认策略是每个 CPU 会启动一个并行实验
-        tune.with_resources(pbt_train, {"gpu": 1}),
-        # 参数一, 定义搜索空间
-        param_space={"lr": 1e-5},
-        # 参数二, 定义调度器或者搜索算法
-        tune_config=tune.TuneConfig(
-            scheduler=pbt,
-            metric="f1",
-            mode="max",
-            num_samples=2,
-        ),
-        # 参数三, 定义运行时配置
-        run_config=air.RunConfig(
-            name="pbt_train",
-            local_dir="./ray_result",
-            sync_config=tune.SyncConfig(syncer=None),  # Disable syncing
-            stop={"training_iteration": 40},
-            failure_config=air.FailureConfig(
-                fail_fast=True,
+    # 从保存目录中恢复
+    local_dir = "./ray_result"
+    train_name = "pbt_train"
+    abs_path = os.path.abspath(os.path.join(local_dir, train_name))
+    # TODO: 这个恢复并不能用
+    if os.path.exists(abs_path):
+        print("从目录中恢复运行", abs_path)
+        tuner = tune.Tuner.restore(abs_path)
+    else:
+        tuner = tune.Tuner(
+            # 资源控制是非常重要的, 默认策略是每个 CPU 会启动一个并行实验
+            tune.with_resources(pbt_train, {"gpu": 1}),
+            # 参数一, 定义搜索空间
+            param_space={"lr": tune.loguniform(1e-6, 1e-3)},
+            # 参数二, 定义调度器或者搜索算法
+            tune_config=tune.TuneConfig(
+                scheduler=pbt,
+                metric="f1",
+                mode="max",
+                num_samples=2,
             ),
-            checkpoint_config=air.CheckpointConfig(
-                num_to_keep=3,
-                checkpoint_score_attribute="f1",
-            )
-        ),
-    )
+            # 参数三, 定义运行时配置
+            run_config=air.RunConfig(
+                name=train_name,
+                local_dir=local_dir,
+                sync_config=tune.SyncConfig(syncer=None),  # Disable syncing
+                stop={"training_iteration": 30, "f1": 0.96},  # 每轮的最大迭代次数, 或者指标达到要求
+                failure_config=air.FailureConfig(
+                    fail_fast=True,
+                ),
+                checkpoint_config=air.CheckpointConfig(
+                    num_to_keep=1,
+                    checkpoint_score_attribute="f1",
+                ),
+                log_to_file=True,
+            ),
+        )
+
     results = tuner.fit()
     best_result = results.get_best_result()  # Get best result object
     best_config = best_result.config  # Get best trial's hyperparameters
