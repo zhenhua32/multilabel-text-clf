@@ -7,3 +7,4 @@
 ./multi_label_data/econbiz/train_data.json
 ./multi_label_data/rcv1-v2/test_data.json
 */wandb/*
+*/ray_result/*

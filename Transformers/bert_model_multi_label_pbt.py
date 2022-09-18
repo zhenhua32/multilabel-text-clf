@@ -6,14 +6,23 @@
 
 import json
 import logging
-import warnings
+import os
+import random
 import time
+import warnings
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import ray
 import torch
 import transformers
+from ray import air, tune
+from ray.air import session
+from ray.air.checkpoint import Checkpoint
+from ray.tune.integration.wandb import WandbLoggerCallback
+from ray.tune.logger import DEFAULT_LOGGERS
+from ray.tune.schedulers import PopulationBasedTraining
 from sklearn import metrics
 from sklearn.preprocessing import MultiLabelBinarizer
 from torch import cuda
@@ -25,13 +34,8 @@ import wandb
 
 logging.basicConfig(level=logging.ERROR)
 warnings.simplefilter("ignore")
-
+tqdm_disable = True
 # endregion
-
-
-# 初始化 wandb
-# wandb.init(project="multilabel", mode="disabled")
-wandb.init(project="multilabel")
 
 # region 导入数据集
 dataset = "R21578"  # [ 'R21578', 'RCV1-V2', 'Econbiz', 'Amazon-531', 'DBPedia-298','NYT AC','GoEmotions']
@@ -63,15 +67,6 @@ LEARNING_RATE = 1e-05
 HF_MODEL = "bert-base-uncased"
 
 tokenizer = BertTokenizer.from_pretrained(HF_MODEL, do_lower_case=True, padding=True)
-wandb.config.update(
-    {
-        "max_len": MAX_LEN,
-        "train_batch_size": TRAIN_BATCH_SIZE,
-        "valid_batch_size": VALID_BATCH_SIZE,
-        "epochs": EPOCHS,
-        "learning_rate": LEARNING_RATE,
-    }
-)
 
 
 # region 将数据集转换成 torch 的 Dataset 类, 并使用 DataLoader
@@ -90,14 +85,20 @@ class CustomDataset(Dataset):
         text = str(self.text[index])
         text = " ".join(text.split())
 
-        inputs = self.tokenizer.encode_plus(
+        # inputs = self.tokenizer.encode_plus(
+        #     text,
+        #     None,
+        #     add_special_tokens=True,
+        #     max_length=self.max_len,
+        #     truncation=True,
+        #     pad_to_max_length=True,
+        #     return_token_type_ids=True,
+        # )
+        inputs = self.tokenizer(
             text,
-            None,
-            add_special_tokens=True,
             max_length=self.max_len,
+            padding="max_length",
             truncation=True,
-            pad_to_max_length=True,
-            return_token_type_ids=True,
         )
         ids = inputs["input_ids"]
         mask = inputs["attention_mask"]
@@ -158,26 +159,12 @@ class BERTClass(torch.nn.Module):
         return output
 
 
-model = BERTClass()
-model.to(device)
-wandb.watch(model)
 # endregion
 
 
 # Define Loss function
 def loss_fn(outputs, targets):
     return torch.nn.BCEWithLogitsLoss()(outputs, targets)
-
-
-optimizer = torch.optim.Adam(params=model.parameters(), lr=LEARNING_RATE)
-
-
-# Plot Val loss
-def loss_plot(epochs, loss):
-    plt.plot(epochs, loss, color="red", label="loss")
-    plt.xlabel("epochs")
-    plt.title("validation loss")
-    plt.savefig(dataset + "_val_loss.png")
 
 
 def validation(model: BERTClass, testing_loader: DataLoader):
@@ -189,7 +176,7 @@ def validation(model: BERTClass, testing_loader: DataLoader):
     fin_targets = []
     fin_outputs = []
     with torch.no_grad():
-        for _, data in tqdm(enumerate(testing_loader, 0), total=len(testing_loader)):
+        for _, data in tqdm(enumerate(testing_loader, 0), total=len(testing_loader), disable=tqdm_disable):
             ids = data["ids"].to(device, dtype=torch.long)
             mask = data["mask"].to(device, dtype=torch.long)
             token_type_ids = data["token_type_ids"].to(device, dtype=torch.long)
@@ -212,128 +199,209 @@ def validation_on_test_data(model: BERTClass, testing_loader: DataLoader):
     # TODO sklearn 也会造成内存爆炸, 而且很慢
     start = time.time()
     accuracy = metrics.accuracy_score(targets, outputs)
-    print(time.time() - start)
+    # print(time.time() - start)
     start = time.time()
     f1_score_avg = metrics.f1_score(targets, outputs, average="samples")
-    print(time.time() - start)
+    # print(time.time() - start)
     start = time.time()
     f1_score_micro = metrics.f1_score(targets, outputs, average="micro")
-    print(time.time() - start)
+    # print(time.time() - start)
     start = time.time()
     f1_score_macro = metrics.f1_score(targets, outputs, average="macro")
-    print(time.time() - start)
+    # print(time.time() - start)
     print(f"Accuracy Score = {accuracy}")
     print(f"F1 Score (Samples) = {f1_score_avg}")
     print(f"F1 Score (Micro) = {f1_score_micro}")
     print(f"F1 Score (Macro) = {f1_score_macro}")
 
-    wandb.log(
-        {
-            "accuracy": accuracy,
-            "f1_score_avg": f1_score_avg,
-            "f1_score_micro": f1_score_micro,
-            "f1_score_macro": f1_score_macro,
-        }
-    )
+    return {
+        "accuracy": accuracy,
+        "f1_score_avg": f1_score_avg,
+        "f1_score_micro": f1_score_micro,
+        "f1_score_macro": f1_score_macro,
+    }
 
-    # Save results
-    with open(dataset + "_results.txt", "w") as f:
-        print(
-            f"F1 Score (Samples) = {f1_score_avg}",
-            f"Accuracy Score = {accuracy}",
-            f"F1 Score (Micro) = {f1_score_micro}",
-            f"F1 Score (Macro) = {f1_score_macro}",
-            file=f,
-        )
+
+def pbt_train(config: dict):
+    # 需要搜索的超参数
+    lr = config["lr"]
+
+    model = BERTClass()
+    model.to(device)
+    optimizer = torch.optim.Adam(params=model.parameters(), lr=lr)
+
+    start = 0
+    ckpt = session.get_checkpoint()
+    if ckpt:
+        with ckpt.as_directory() as checkpoint_dir:
+            print("从检查点加载", checkpoint_dir)
+            ckpt = torch.load(os.path.join(checkpoint_dir, "model.pth"))
+            model_state_dict = ckpt["model_state_dict"]
+            optimizer_state_dict = ckpt["optimizer_state_dict"]
+            start = ckpt["step"]
+            model.load_state_dict(model_state_dict)
+            optimizer.load_state_dict(optimizer_state_dict)
+
+    for step in range(start, EPOCHS):
+        result = train_one_epoch(training_loader, validation_loader, model, optimizer, step)
+
+        checkpoint = None
+        if step % 2 == 0:
+            checkpoint_dir = "./ray_result"
+            os.makedirs(checkpoint_dir, exist_ok=True)
+            torch.save(
+                {
+                    "step": step,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "f1": result["f1_score_avg"],
+                },
+                os.path.join(checkpoint_dir, "model.pth"),
+            )
+            checkpoint = Checkpoint.from_directory(checkpoint_dir)
+
+        session.report({"f1": result["f1_score_avg"]}, checkpoint=checkpoint)
 
 
 # Train Model
-def train_model(
-    start_epochs: int,
-    n_epochs: int,
+def train_one_epoch(
     training_loader: DataLoader,
     validation_loader: DataLoader,
     model: BERTClass,
     optimizer: torch.optim.Optimizer,
+    epoch: int,
 ):
     loss_vals = []  # 验证集的损失
-    for epoch in range(start_epochs, n_epochs + 1):
-        train_loss = 0
-        valid_loss = 0
-        total_train = 0
-        total_valid = 0
+    train_loss = 0
+    valid_loss = 0
+    total_train = 0
+    total_valid = 0
 
-        ######################
-        # Train the model #
-        ######################
+    ######################
+    # Train the model #
+    ######################
 
-        model.train()
-        print("############# Epoch {}: Training Start   #############".format(epoch))
-        for batch_idx, data in tqdm(enumerate(training_loader), total=len(training_loader)):
-            optimizer.zero_grad()
+    model.train()
+    print("############# Epoch {}: Training Start   #############".format(epoch))
+    for batch_idx, data in tqdm(enumerate(training_loader), total=len(training_loader), disable=tqdm_disable):
+        optimizer.zero_grad()
 
-            # Forward
+        # Forward
+        ids = data["ids"].to(device, dtype=torch.long)
+        targets = data["targets"].to(device, dtype=torch.float)
+        mask = data["mask"].to(device, dtype=torch.long)
+        token_type_ids = data["token_type_ids"].to(device, dtype=torch.long)
+        outputs = model(ids, mask, token_type_ids)
+        # Backward
+        loss = loss_fn(outputs, targets)
+        loss.backward()
+        optimizer.step()
+        # 应该怎么计算 loss, 让训练集的 loss 和验证集的 loss 可以比较
+        # 当前这个公式就是前面的 train_loss 的和除以 batch_idx
+        train_loss = train_loss + ((1 / (batch_idx + 1)) * (loss.item() - train_loss))
+        total_train += loss.item()
+
+        if batch_idx % 100 == 0:
+            print({"train_loss": train_loss, "batch_idx": batch_idx, "epoch": epoch})
+
+    ######################
+    # Validate the model #
+    ######################
+
+    model.eval()
+    with torch.no_grad():
+        for batch_idx, data in enumerate(validation_loader, 0):
             ids = data["ids"].to(device, dtype=torch.long)
             targets = data["targets"].to(device, dtype=torch.float)
             mask = data["mask"].to(device, dtype=torch.long)
             token_type_ids = data["token_type_ids"].to(device, dtype=torch.long)
             outputs = model(ids, mask, token_type_ids)
-            # Backward
+
             loss = loss_fn(outputs, targets)
-            loss.backward()
-            optimizer.step()
-            # 应该怎么计算 loss, 让训练集的 loss 和验证集的 loss 可以比较
-            # 当前这个公式就是前面的 train_loss 的和除以 batch_idx
-            train_loss = train_loss + ((1 / (batch_idx + 1)) * (loss.item() - train_loss))
-            total_train += loss.item()
+            valid_loss = valid_loss + ((1 / (batch_idx + 1)) * (loss.item() - valid_loss))
+            total_valid += loss.item()
 
             if batch_idx % 100 == 0:
-                wandb.log({"train_loss": train_loss, "batch_idx": batch_idx, "epoch": epoch})
+                print({"valid_loss": valid_loss, "batch_idx": batch_idx, "epoch": epoch})
 
-        ######################
-        # Validate the model #
-        ######################
-
-        model.eval()
-        with torch.no_grad():
-            for batch_idx, data in enumerate(validation_loader, 0):
-                ids = data["ids"].to(device, dtype=torch.long)
-                targets = data["targets"].to(device, dtype=torch.float)
-                mask = data["mask"].to(device, dtype=torch.long)
-                token_type_ids = data["token_type_ids"].to(device, dtype=torch.long)
-                outputs = model(ids, mask, token_type_ids)
-
-                loss = loss_fn(outputs, targets)
-                valid_loss = valid_loss + ((1 / (batch_idx + 1)) * (loss.item() - valid_loss))
-                total_valid += loss.item()
-
-                if batch_idx % 100 == 0:
-                    wandb.log({"valid_loss": valid_loss, "batch_idx": batch_idx, "epoch": epoch})
-
-            # calculate average losses
-            print(train_loss, len(training_loader), total_train, total_train / len(training_loader))
-            print(valid_loss, len(validation_loader), total_valid, total_valid / len(validation_loader))
-            train_loss = train_loss / len(training_loader)
-            valid_loss = valid_loss / len(validation_loader)
-            # print training/validation statistics
-            print(
-                "Epoch: {} \tAverage Training Loss: {:.6f} \tAverage Validation Loss: {:.6f}".format(
-                    epoch, train_loss, valid_loss
-                )
+        # calculate average losses
+        print(train_loss, len(training_loader), total_train, total_train / len(training_loader))
+        print(valid_loss, len(validation_loader), total_valid, total_valid / len(validation_loader))
+        train_loss = train_loss / len(training_loader)
+        valid_loss = valid_loss / len(validation_loader)
+        # print training/validation statistics
+        print(
+            "Epoch: {} \tAverage Training Loss: {:.6f} \tAverage Validation Loss: {:.6f}".format(
+                epoch, train_loss, valid_loss
             )
-            loss_vals.append(valid_loss)
+        )
+        loss_vals.append(valid_loss)
 
-            wandb.log({"train_loss": train_loss, "valid_loss": valid_loss, "epoch": epoch})
+        print({"train_loss": train_loss, "valid_loss": valid_loss, "epoch": epoch})
 
-        # 每次执行完后评估一下
-        validation_on_test_data(model, validation_loader)
+    # 每次执行完后评估一下
+    return validation_on_test_data(model, validation_loader)
 
-    # Plot loss
-    loss_plot(np.linspace(1, n_epochs, n_epochs).astype(int), loss_vals)
-    return model
+
+def run_tune_pbt():
+    pbt = PopulationBasedTraining(
+        time_attr="training_iteration",
+        perturbation_interval=4,
+        hyperparam_mutations={
+            "lr": lambda: random.uniform(1e-6, 1e-4),
+        },
+    )
+
+    tuner = tune.Tuner(
+        # 资源控制是非常重要的, 默认策略是每个 CPU 会启动一个并行实验
+        tune.with_resources(pbt_train, {"gpu": 1}),
+        # 参数一, 定义搜索空间
+        param_space={"lr": 1e-5},
+        # 参数二, 定义调度器或者搜索算法
+        tune_config=tune.TuneConfig(
+            scheduler=pbt,
+            metric="f1",
+            mode="max",
+            num_samples=2,
+        ),
+        # 参数三, 定义运行时配置
+        run_config=air.RunConfig(
+            name="pbt_train",
+            local_dir="./ray_result",
+            sync_config=tune.SyncConfig(syncer=None),  # Disable syncing
+            stop={"training_iteration": 40},
+            failure_config=air.FailureConfig(
+                fail_fast=True,
+            ),
+            checkpoint_config=air.CheckpointConfig(
+                num_to_keep=3,
+                checkpoint_score_attribute="f1",
+            )
+        ),
+    )
+    results = tuner.fit()
+    best_result = results.get_best_result()  # Get best result object
+    best_config = best_result.config  # Get best trial's hyperparameters
+    best_logdir = best_result.log_dir  # Get best trial's logdir
+    best_checkpoint = best_result.checkpoint  # Get best trial's best checkpoint
+    best_metrics = best_result.metrics  # Get best trial's last results
+    best_result_df = best_result.metrics_dataframe  # Get best result as pandas dataframe
+
+    print(best_config)
+    print(best_logdir)
+    print(best_checkpoint)
+    print(best_metrics)
+
+    with best_checkpoint.as_directory() as checkpoint_dir:
+        ckpt = torch.load(os.path.join(checkpoint_dir, "model.pth"), map_location=device)
+        model = BERTClass()
+        model.to(device)
+        model.load_state_dict(ckpt["model_state_dict"])
+        validation_on_test_data(model, testing_loader)
+    breakpoint()
 
 
 # 训练模型
-trained_model = train_model(1, EPOCHS, training_loader, validation_loader, model, optimizer)
-print("最后在测试集上进行验证")
-validation_on_test_data(trained_model, testing_loader)
+if __name__ == "__main__":
+    ray.init()
+    run_tune_pbt()
