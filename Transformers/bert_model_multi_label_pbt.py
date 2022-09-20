@@ -1,5 +1,6 @@
 """
-主要验证下怎么减少内存的使用, Econbiz 这个数据集有100w的数据, 直接全部加载的话, 内存会炸
+太坑, 无法用 ray-tune 进行训练, 总是跑到一半就报错, 然后有时候会产生超多的检查点, 直接把硬盘吃满.
+准备换成 optuna 试试
 """
 
 # region 导入模块
@@ -249,6 +250,7 @@ def pbt_train(config: dict):
         checkpoint = None
         if step % 2 == 0:
             checkpoint_dir = "./ray_result"
+            print("保存检查点到", os.path.abspath(checkpoint_dir))
             os.makedirs(checkpoint_dir, exist_ok=True)
             torch.save(
                 {
@@ -372,7 +374,7 @@ def run_tune_pbt():
                 scheduler=pbt,
                 metric="f1",
                 mode="max",
-                num_samples=2,
+                num_samples=8,
             ),
             # 参数三, 定义运行时配置
             run_config=air.RunConfig(
